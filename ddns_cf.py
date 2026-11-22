@@ -5,18 +5,27 @@ ddns-cf — Cloudflare DDNS + network watchdog for Debian / Ubuntu VPS.
 Features
   1. Cloudflare DDNS: keeps A (IPv4) and AAAA (IPv6) records in sync with the public IP.
   2. All credentials / settings are read from a .env file.
-  3. Watchdog: detects network loss and recovers automatically, escalating:
-       L1  DHCP renew        (networkctl renew / nmcli reapply / dhclient)
+  3. PPPoE uplink preference (PPP_ENABLE, pppd / pon):
+       - while ppp0 is up, the system IPv4 default route is forced onto ppp0
+         (other default routes are kept as higher-metric backups)
+       - when ppp0 drops: redial with poff/pon; if that fails, fall back to DHCP on the
+         physical NIC and keep redialing every PPP_RETRY_INTERVAL seconds (default 60);
+         as soon as ppp0 is back, traffic switches back to it and DDNS is re-synced
+       - only ppp0 may exist: the pppd behind any other pppN (e.g. ppp1) is terminated
+  4. Watchdog: detects network loss and recovers automatically, escalating:
+       L0  PPP redial        (poff + pon, only when PPP is enabled)
+       L1  DHCP renew        (networkctl renew / nmcli reapply / dhclient / dhcpcd)
        L2  restart network   (netplan apply / systemd-networkd / NetworkManager / networking)
        L3  reboot            (optional, off by default)
-  4. Designed to run as a systemd service (see ddns-cf.service / install.sh).
+  5. Designed to run as a systemd service (see ddns-cf.service / install.sh).
 
 Pure Python 3 standard library (3.8+). No pip packages needed.
 
 Usage
   ddns_cf.py run        # daemon: watchdog + periodic DDNS (default)
   ddns_cf.py ddns       # one-shot DDNS update, then exit
-  ddns_cf.py check      # print config, detected network stack, connectivity, public IPs
+  ddns_cf.py check      # print config, PPP / route status, network stack, connectivity, public IPs
+  ddns_cf.py dial       # (re)dial PPP once and point the default route at it (needs root)
   ddns_cf.py recover    # run the recovery sequence once (for testing, needs root)
 Options
   --env PATH            # .env location (default: .env next to this script, then /opt/ddns-cf/.env)
@@ -36,8 +45,9 @@ import urllib.error
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 log = logging.getLogger("ddns-cf")
+_stop = False  # set by SIGTERM / SIGINT
 
 # ─────────────────────────────── .env handling ────────────────────────────────
 
@@ -60,7 +70,13 @@ DEFAULTS = {
     "CHECK_METHOD": "auto",      # auto | ping | tcp
     "CHECK_TCP_PORT": "443",
     "FAIL_THRESHOLD": "3",       # consecutive failed checks before recovery starts
-    "NET_IFACE": "",             # interface to recover; auto-detected from default route if empty
+    "NET_IFACE": "",             # physical NIC for DHCP fallback / recovery; auto-detected if empty
+    "PPP_ENABLE": "auto",        # auto = on if /etc/ppp/peers/$PPP_PROVIDER exists | true | false
+    "PPP_IFACE": "ppp0",         # the only ppp interface allowed; others (ppp1...) get terminated
+    "PPP_PROVIDER": "dsl-provider",  # peer name for pon/poff (pppoeconf default)
+    "PPP_DIAL_TIMEOUT": "30",    # seconds to wait for PPP_IFACE to get an IPv4 after pon
+    "PPP_RETRY_INTERVAL": "60",  # while PPP is down, redial this often (DHCP is used in between)
+    "PPP_ROUTE_METRIC": "0",     # metric of the default route via PPP_IFACE
     "RECOVERY_WAIT": "20",       # seconds to wait after each recovery step before re-checking
     "RECOVERY_COOLDOWN": "300",  # seconds between full recovery rounds
     "REBOOT_ON_FAILURE": "false",
@@ -87,8 +103,8 @@ def load_env(path: str) -> Dict[str, str]:
                 continue
             k, v = line.split("=", 1)
             k, v = k.strip(), v.strip()
-            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-                v = v[1:-1]
+            if v[:1] in ("'", '"') and v.find(v[0], 1) > 0:   # KEY="value"  # comment
+                v = v[1:v.find(v[0], 1)]
             elif " #" in v:
                 v = v.split(" #", 1)[0].rstrip()
             cfg[k] = v
@@ -281,7 +297,11 @@ class DDNS:
         return ok
 
 
-# ─────────────────────────────── Network watchdog ─────────────────────────────
+# ─────────────────────────────── system helpers ───────────────────────────────
+
+# interfaces that are never the physical / DHCP uplink
+VIRTUAL_PREFIXES = ("lo", "ppp", "docker", "veth", "br-", "virbr", "tun", "tap", "wg", "tailscale", "zt")
+
 
 def sh(cmd: List[str], timeout=60) -> Tuple[int, str]:
     try:
@@ -294,6 +314,27 @@ def sh(cmd: List[str], timeout=60) -> Tuple[int, str]:
         return 124, "timeout"
 
 
+def nap(sec: float) -> None:
+    """sleep() that returns early on SIGTERM / SIGINT."""
+    end = time.time() + sec
+    while not _stop:
+        left = end - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(1.0, left))
+
+
+def wait_for(pred, sec: float) -> bool:
+    """Poll pred() once per second for up to `sec` seconds."""
+    end = time.time() + sec
+    while True:
+        if pred():
+            return True
+        if _stop or time.time() >= end:
+            return False
+        time.sleep(1)
+
+
 def unit_active(name: str) -> bool:
     return sh(["systemctl", "is-active", "--quiet", name], 10)[0] == 0
 
@@ -303,18 +344,86 @@ def unit_exists(name: str) -> bool:
     return code == 0 and name in out
 
 
-def default_iface() -> Optional[str]:
+def _kv(parts: List[str], key: str) -> Optional[str]:
+    """value following `key` in a tokenised `ip` output line."""
+    try:
+        return parts[parts.index(key) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+# ─────────────────────────────── interfaces / routes ──────────────────────────
+
+def iface_exists(name: Optional[str]) -> bool:
+    return bool(name) and os.path.exists("/sys/class/net/%s" % name)
+
+
+def iface_ipv4(name: str) -> Optional[str]:
+    code, out = sh(["ip", "-4", "-o", "addr", "show", "dev", name], 5)
+    if code == 0:
+        for line in out.splitlines():
+            ip = _kv(line.split(), "inet")
+            if ip:
+                return ip.split("/")[0]
+    return None
+
+
+def ppp_ifaces() -> List[str]:
+    try:
+        return sorted(n for n in os.listdir("/sys/class/net") if n.startswith("ppp"))
+    except OSError:
+        return []
+
+
+def route_dev(probe: str) -> Optional[str]:
+    """Interface the kernel would use right now to reach `probe` (no packet is sent)."""
+    code, out = sh(["ip", "-4", "route", "get", probe], 5)
+    return _kv(out.split(), "dev") if code == 0 else None
+
+
+def default_routes() -> List[List[str]]:
+    code, out = sh(["ip", "-4", "route", "show", "default"], 5)
+    return [line.split() for line in out.splitlines() if line.strip()] if code == 0 else []
+
+
+def ppp_peer_nic(provider: str) -> Optional[str]:
+    """Ethernet NIC used by a PPPoE peer file (`nic-eth0`, `plugin rp-pppoe.so eth0`, or a bare `eth0`)."""
+    try:
+        with open(os.path.join("/etc/ppp/peers", provider)) as f:
+            for line in f:
+                t = line.split("#", 1)[0].split()
+                if not t:
+                    continue
+                for tok in t:
+                    if tok.startswith("nic-"):
+                        return tok[4:]
+                if t[0] == "plugin" and len(t) >= 3 and "pppoe" in t[1]:
+                    return t[2]
+                if len(t) == 1 and iface_exists(t[0]) and not t[0].startswith(VIRTUAL_PREFIXES):
+                    return t[0]
+    except OSError:
+        pass
+    return None
+
+
+def dhcp_iface(cfg) -> Optional[str]:
+    """Physical interface used for DHCP fallback / recovery (never a ppp interface)."""
+    if cfg.get("NET_IFACE"):
+        return cfg["NET_IFACE"]
     for fam in ("-4", "-6"):
         code, out = sh(["ip", fam, "route", "show", "default"], 5)
-        if code == 0:
-            parts = out.split()
-            if "dev" in parts:
-                return parts[parts.index("dev") + 1]
-    # no default route (typical while offline): first UP non-loopback interface
+        for line in (out.splitlines() if code == 0 else []):
+            dev = _kv(line.split(), "dev")
+            if dev and not dev.startswith(VIRTUAL_PREFIXES):
+                return dev
+    nic = ppp_peer_nic(cfg.get("PPP_PROVIDER") or "dsl-provider")
+    if nic:
+        return nic
+    # nothing routed (typical while offline): first non-virtual interface
     code, out = sh(["ip", "-o", "link", "show"], 5)
     for line in out.splitlines():
         name = line.split(":")[1].strip().split("@")[0] if ":" in line else ""
-        if name and name != "lo" and not name.startswith(("docker", "veth", "br-", "virbr", "tun", "wg")):
+        if name and not name.startswith(VIRTUAL_PREFIXES):
             return name
     return None
 
@@ -348,6 +457,60 @@ def detect_stack() -> Dict[str, bool]:
     }
 
 
+# ─────────────────────────────── pppd processes ───────────────────────────────
+
+def _alive(pid: int) -> bool:
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def pppd_pids(provider: str = "") -> List[int]:
+    """PIDs of running pppd processes (optionally only those started with `call <provider>`)."""
+    pids = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % d, "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0]) == b"pppd" and (not provider or provider.encode() in argv):
+            pids.append(int(d))
+    return pids
+
+
+def iface_pppd_pid(iface: str) -> Optional[int]:
+    """pppd writes /run/<iface>.pid once the interface exists."""
+    for d in ("/run", "/var/run"):
+        try:
+            with open(os.path.join(d, iface + ".pid")) as f:
+                pid = int(f.readline().strip())
+        except (OSError, ValueError):
+            continue
+        if _alive(pid):
+            return pid
+    return None
+
+
+def kill_pid(pid: int, grace=5) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    if wait_for(lambda: not _alive(pid), grace):
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+# ─────────────────────────────── Network watchdog ─────────────────────────────
+
 class Watchdog:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -357,6 +520,19 @@ class Watchdog:
         self.started = time.time()
         m = cfg.get("CHECK_METHOD", "auto").lower()
         self.method = ("ping" if shutil.which("ping") else "tcp") if m == "auto" else m
+        # address used for `ip route get` (never actually contacted)
+        self.probe = next((t for t in lst(cfg, "CHECK_TARGETS") if ":" not in t), "1.1.1.1")
+
+        # PPP
+        self.ppp_if = cfg.get("PPP_IFACE") or "ppp0"
+        self.provider = cfg.get("PPP_PROVIDER") or "dsl-provider"
+        mode = str(cfg.get("PPP_ENABLE", "auto")).strip().lower()
+        self.ppp = os.path.isfile(os.path.join("/etc/ppp/peers", self.provider)) if mode == "auto" \
+            else b(cfg, "PPP_ENABLE")
+        self.uplink: Optional[str] = None     # "ppp" | "dhcp" (None until first decision / PPP disabled)
+        self.last_dial = 0.0
+        self.ppp_ip: Optional[str] = None     # last seen IPv4 on PPP_IFACE (new IP -> force DDNS)
+        self._children: List[subprocess.Popen] = []
 
     # ---- connectivity ----
     def _probe(self, target: str) -> bool:
@@ -375,9 +551,161 @@ class Watchdog:
     def online(self) -> bool:
         return any(self._probe(t) for t in lst(self.cfg, "CHECK_TARGETS"))
 
+    # ---- PPP ----
+    def ppp_up(self) -> bool:
+        return iface_exists(self.ppp_if) and iface_ipv4(self.ppp_if) is not None
+
+    def kill_extra_ppp(self) -> None:
+        """Only PPP_IFACE may exist: terminate the pppd behind any other pppN (e.g. a stray ppp1)."""
+        extras = [n for n in ppp_ifaces() if n != self.ppp_if]
+        if not extras:
+            return
+        keep = iface_pppd_pid(self.ppp_if)
+        for name in extras:
+            pid = iface_pppd_pid(name)
+            victims = [pid] if pid and pid != keep else [p for p in pppd_pids() if p != keep]
+            for p in victims:
+                log.warning("PPP: extra interface %s found, terminating pppd %d (keeping only %s)",
+                            name, p, self.ppp_if)
+                kill_pid(p)
+
+    def _spawn(self, cmd: List[str]) -> None:
+        # pppd normally daemonises, but with `nodetach`/`updetach` it would block or be killed by
+        # a timeout, so run it detached and never kill it.
+        try:
+            self._children.append(subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True))
+        except OSError as e:
+            log.error("PPP: cannot run %s: %s", cmd[0], e)
+
+    def _reap(self) -> None:
+        self._children = [p for p in self._children if p.poll() is None]
+
+    def ppp_dial(self, force=False) -> bool:
+        """Bring PPP_IFACE up with poff/pon and wait PPP_DIAL_TIMEOUT for an IPv4 address.
+        force=True hangs up and redials even if the link looks up."""
+        first = self.last_dial == 0.0
+        self.last_dial = time.time()
+        if not shutil.which("pon"):
+            log.error("PPP: 'pon' not found (apt install ppp)")
+            return False
+        timeout = i(self.cfg, "PPP_DIAL_TIMEOUT")
+        self.kill_extra_ppp()
+        if not force:
+            if self.ppp_up():
+                return True
+            # at boot ifupdown may already be dialing: give that pppd a chance first
+            if first and pppd_pids(self.provider):
+                log.info("PPP: pppd for %s already running, waiting up to %ss", self.provider, timeout)
+                if wait_for(self.ppp_up, timeout):
+                    self.kill_extra_ppp()
+                    return True
+        if pppd_pids(self.provider) or iface_exists(self.ppp_if):
+            log.warning("PPP: poff %s", self.provider)
+            sh(["poff", self.provider], 15)
+            wait_for(lambda: not pppd_pids(self.provider) and not iface_exists(self.ppp_if), 10)
+        unit = self.ppp_if[3:] if self.ppp_if.startswith("ppp") and self.ppp_if[3:].isdigit() else None
+        cmd = ["pon", self.provider] + (["unit", unit] if unit else [])   # ask pppd for ppp0, not ppp1
+        log.warning("PPP: dialing (%s)", " ".join(cmd))
+        self._spawn(cmd)
+        ok = wait_for(self.ppp_up, timeout)
+        self.kill_extra_ppp()
+        if ok:
+            log.warning("PPP: %s is up, IPv4 %s", self.ppp_if, iface_ipv4(self.ppp_if))
+        else:
+            log.warning("PPP: %s did not come up within %ss", self.ppp_if, timeout)
+        return ok
+
+    # ---- routes ----
+    def ensure_ppp_route(self) -> None:
+        """Make PPP_IFACE the IPv4 default route; other default routes are kept as backups."""
+        if route_dev(self.probe) == self.ppp_if:
+            return
+        metric = i(self.cfg, "PPP_ROUTE_METRIC")
+        for r in default_routes():
+            if _kv(r, "dev") != self.ppp_if and int(_kv(r, "metric") or 0) <= metric:
+                self._demote(r, metric)
+        code, out = sh(["ip", "-4", "route", "replace", "default", "dev", self.ppp_if,
+                        "metric", str(metric)], 5)
+        if code == 0:
+            log.warning("route: IPv4 default -> %s (metric %d)", self.ppp_if, metric)
+        else:
+            log.error("route: failed to set default via %s: %s", self.ppp_if, out)
+
+    @staticmethod
+    def _demote(r: List[str], metric: int) -> None:
+        """Re-add a competing default route with a higher metric so it stays as a backup."""
+        base = ["default"]
+        for k in ("via", "dev", "proto", "src"):
+            v = _kv(r, k)
+            if v:
+                base += [k, v]
+        if "onlink" in r:
+            base.append("onlink")
+        old = int(_kv(r, "metric") or 0)
+        for new in range(metric + 100, metric + 110):
+            if sh(["ip", "-4", "route", "add"] + base + ["metric", str(new)], 5)[0] == 0:
+                sh(["ip", "-4", "route", "del"] + base + ["metric", str(old)], 5)
+                log.info("route: %s default kept as backup (metric %d -> %d)", _kv(r, "dev"), old, new)
+                return
+        log.warning("route: could not keep '%s' as backup; it will be replaced", " ".join(r))
+
+    def fallback_dhcp(self) -> None:
+        dev = route_dev(self.probe)
+        if dev and not dev.startswith("ppp"):
+            log.warning("uplink: PPP unavailable, traffic now via %s (DHCP fallback)", dev)
+            return
+        iface = dhcp_iface(self.cfg)
+        log.warning("uplink: PPP unavailable and no usable default route, DHCP on %s", iface)
+        self.step_dhcp(detect_stack(), iface)
+
+    def select_uplink(self) -> bool:
+        """Prefer PPP_IFACE. While it is down, redial every PPP_RETRY_INTERVAL seconds and use
+        DHCP in between. Returns True when the active uplink changed (caller re-syncs DDNS)."""
+        if not self.ppp:
+            return False
+        self._reap()
+        self.kill_extra_ppp()
+        prev = self.uplink
+        if self.ppp_up():
+            self.uplink = "ppp"
+        else:
+            if prev == "ppp":
+                log.warning("PPP: %s went down", self.ppp_if)
+            if prev != "dhcp" or time.time() - self.last_dial >= i(self.cfg, "PPP_RETRY_INTERVAL"):
+                self.uplink = "ppp" if self.ppp_dial() else "dhcp"
+                if self.uplink == "dhcp" and prev != "dhcp":
+                    self.fallback_dhcp()
+        ip = None
+        if self.uplink == "ppp":
+            self.ensure_ppp_route()
+            ip = iface_ipv4(self.ppp_if)
+        ip_changed = bool(ip and self.ppp_ip and ip != self.ppp_ip)
+        if ip:
+            self.ppp_ip = ip
+        if prev != self.uplink:
+            log.warning("uplink: %s -> %s", prev or "start", self.uplink)
+            return prev is not None
+        if ip_changed:
+            log.warning("PPP: %s address changed, re-syncing DDNS", self.ppp_if)
+        return ip_changed
+
+    def sleep_hint(self, default: int) -> float:
+        """Seconds until the next tick: shorter while waiting for the next PPP redial."""
+        if self.ppp and self.uplink == "dhcp":
+            due = self.last_dial + i(self.cfg, "PPP_RETRY_INTERVAL") - time.time()
+            return max(1.0, min(default, due))
+        return default
+
     # ---- recovery steps ----
-    def _iface(self) -> Optional[str]:
-        return self.cfg.get("NET_IFACE") or default_iface()
+    def step_ppp(self) -> bool:
+        log.warning("L0: PPP redial %s", self.provider)
+        ok = self.ppp_dial(force=True)
+        self.uplink = "ppp" if ok else "dhcp"
+        if ok:
+            self.ensure_ppp_route()
+        return ok
 
     def step_dhcp(self, st, iface) -> bool:
         if not iface:
@@ -437,16 +765,31 @@ class Watchdog:
 
     def recover(self) -> bool:
         st = detect_stack()
-        iface = self._iface()
-        log.warning("network DOWN — starting recovery (iface=%s, stack=%s)",
-                    iface, ",".join(k for k, v in st.items() if v) or "unknown")
+        iface = dhcp_iface(self.cfg)
+        log.warning("network DOWN — starting recovery (uplink=%s, dhcp iface=%s, stack=%s)",
+                    self.uplink or "-", iface, ",".join(k for k, v in st.items() if v) or "unknown")
         wait = i(self.cfg, "RECOVERY_WAIT")
-        for name, step in (("DHCP renew", self.step_dhcp), ("network restart", self.step_restart)):
-            if step(st, iface):
-                time.sleep(wait)
-                if self.online():
-                    log.warning("network RESTORED after %s", name)
-                    return True
+        steps = [("PPP redial", self.step_ppp)] if self.ppp else []
+        steps += [("DHCP renew", lambda: self.step_dhcp(st, iface)),
+                  ("network restart", lambda: self.step_restart(st, iface))]
+        for name, step in steps:
+            if _stop:
+                return False
+            if not step():
+                continue
+            if step != self.step_ppp:
+                nap(wait)
+                if self.ppp and self.ppp_up():   # e.g. ifupdown re-dialed during the restart
+                    self.uplink = "ppp"
+                    self.ensure_ppp_route()
+            if self.online():
+                log.warning("network RESTORED after %s (uplink %s)", name, self.uplink or iface)
+                return True
+            if step == self.step_ppp:
+                # PPP has an address but no internet: hang up so the DHCP route takes over
+                log.warning("PPP: %s is up but offline, hanging up and falling back to DHCP", self.ppp_if)
+                sh(["poff", self.provider], 15)
+                self.uplink = "dhcp"
         self.failed_rounds += 1
         log.error("recovery round failed (%d consecutive)", self.failed_rounds)
         if b(self.cfg, "REBOOT_ON_FAILURE") and self.failed_rounds >= i(self.cfg, "REBOOT_AFTER_ROUNDS"):
@@ -454,36 +797,35 @@ class Watchdog:
             sh(["systemctl", "reboot"], 30)
         return False
 
-    def tick(self) -> Optional[bool]:
-        """Returns True if the network was just restored, else None."""
+    def tick(self) -> bool:
+        """One watchdog cycle. Returns True when the uplink changed or the network was just
+        restored (the caller then forces a DDNS sync)."""
+        changed = self.select_uplink()
         if self.online():
             if self.fails:
                 log.info("network OK again after %d failed checks", self.fails)
             self.fails = 0
             self.failed_rounds = 0
-            return None
+            return changed
         self.fails += 1
         log.warning("connectivity check failed (%d/%d)", self.fails, i(self.cfg, "FAIL_THRESHOLD"))
         if self.fails < i(self.cfg, "FAIL_THRESHOLD"):
-            return None
+            return changed
         now = time.time()
         if now - self.started < i(self.cfg, "BOOT_GRACE"):
             log.info("within boot grace period, not recovering yet")
-            return None
+            return changed
         if now - self.last_recovery < i(self.cfg, "RECOVERY_COOLDOWN"):
-            return None
+            return changed
         self.last_recovery = now
         if self.recover():
             self.fails = 0
             self.failed_rounds = 0
             return True
-        return None
+        return changed
 
 
 # ─────────────────────────────── main ─────────────────────────────────────────
-
-_stop = False
-
 
 def _on_signal(signum, _frame):
     global _stop
@@ -507,22 +849,23 @@ def cmd_run(cfg):
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
     ddns, wd = DDNS(cfg), Watchdog(cfg)
-    log.info("ddns-cf %s started: records=%s, check every %ss (%s), DDNS every %ss",
-             VERSION, ",".join(lst(cfg, "CF_RECORDS")), cfg["CHECK_INTERVAL"], wd.method, cfg["DDNS_INTERVAL"])
+    log.info("ddns-cf %s started: records=%s, check every %ss (%s), DDNS every %ss, PPP %s",
+             VERSION, ",".join(lst(cfg, "CF_RECORDS")), cfg["CHECK_INTERVAL"], wd.method, cfg["DDNS_INTERVAL"],
+             "%s via %s, redial every %ss" % (wd.ppp_if, wd.provider, cfg["PPP_RETRY_INTERVAL"])
+             if wd.ppp else "disabled")
+    if wd.ppp and os.geteuid() != 0:
+        log.warning("not running as root: PPP dialing and route changes will fail")
     next_ddns = 0.0
     while not _stop:
-        restored = wd.tick()
+        force = wd.tick()
         now = time.time()
-        if restored or (now >= next_ddns and wd.fails == 0):
+        if force or (now >= next_ddns and wd.fails == 0):
             try:
-                ddns.run(force=bool(restored) or next_ddns == 0.0)
+                ddns.run(force=force or next_ddns == 0.0)
             except Exception as e:  # noqa: BLE001
                 log.error("DDNS error: %s", e)
             next_ddns = now + i(cfg, "DDNS_INTERVAL")
-        for _ in range(i(cfg, "CHECK_INTERVAL")):
-            if _stop:
-                break
-            time.sleep(1)
+        nap(wd.sleep_hint(i(cfg, "CHECK_INTERVAL")))
     log.info("stopped")
 
 
@@ -542,13 +885,39 @@ def cmd_check(cfg):
         except Exception as e:  # noqa: BLE001
             print("token check : FAILED -", e)
     st = detect_stack()
-    print("interface   :", cfg.get("NET_IFACE") or default_iface(), "(configured)" if cfg.get("NET_IFACE") else "(auto)")
-    print("net stack   :", ", ".join(k for k, v in st.items() if v) or "unknown")
     wd = Watchdog(cfg)
+    if wd.ppp:
+        up = wd.ppp_up()
+        print("ppp         : enabled (provider=%s, iface=%s, redial every %ss)"
+              % (wd.provider, wd.ppp_if, cfg["PPP_RETRY_INTERVAL"]))
+        print("ppp status  :", ("UP, IPv4 %s" % iface_ipv4(wd.ppp_if)) if up else "DOWN",
+              "| pppd pids:", pppd_pids(wd.provider) or "none", "| pon:", shutil.which("pon") or "NOT FOUND")
+        extras = [n for n in ppp_ifaces() if n != wd.ppp_if]
+        if extras:
+            print("ppp extras  :", ", ".join(extras), "(will be terminated)")
+    else:
+        print("ppp         : disabled (PPP_ENABLE=%s, /etc/ppp/peers/%s %s)"
+              % (cfg.get("PPP_ENABLE"), wd.provider,
+                 "exists" if os.path.isfile("/etc/ppp/peers/" + wd.provider) else "missing"))
+    print("route dev   :", route_dev(wd.probe) or "NO ROUTE")
+    print("dhcp iface  :", dhcp_iface(cfg), "(configured)" if cfg.get("NET_IFACE") else "(auto)")
+    print("net stack   :", ", ".join(k for k, v in st.items() if v) or "unknown")
     print("check method:", wd.method)
     print("online      :", wd.online())
     print("public IPv4 :", public_ip(cfg, False) if b(cfg, "CF_ENABLE_IPV4") else "(disabled)")
     print("public IPv6 :", public_ip(cfg, True) if b(cfg, "CF_ENABLE_IPV6") else "(disabled)")
+
+
+def cmd_dial(cfg):
+    if os.geteuid() != 0:
+        raise SystemExit("dial needs root")
+    wd = Watchdog(cfg)
+    if not wd.ppp:
+        raise SystemExit("PPP is disabled (PPP_ENABLE / PPP_PROVIDER)")
+    ok = wd.ppp_dial(force=True)
+    if ok:
+        wd.ensure_ppp_route()
+    sys.exit(0 if ok else 1)
 
 
 def cmd_recover(cfg):
@@ -558,9 +927,12 @@ def cmd_recover(cfg):
     sys.exit(0 if wd.recover() else 1)
 
 
+COMMANDS = {"run": cmd_run, "ddns": cmd_ddns, "check": cmd_check, "dial": cmd_dial, "recover": cmd_recover}
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Cloudflare DDNS + network watchdog")
-    ap.add_argument("command", nargs="?", default="run", choices=["run", "ddns", "check", "recover"])
+    ap = argparse.ArgumentParser(description="Cloudflare DDNS + PPPoE-aware network watchdog")
+    ap.add_argument("command", nargs="?", default="run", choices=list(COMMANDS))
     ap.add_argument("--env", help="path to .env")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
@@ -572,7 +944,7 @@ def main():
                         else "%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
     cfg = load_env(env_path)
     log.setLevel("DEBUG" if a.verbose else cfg.get("LOG_LEVEL", "INFO").upper())
-    {"run": cmd_run, "ddns": cmd_ddns, "check": cmd_check, "recover": cmd_recover}[a.command](cfg)
+    COMMANDS[a.command](cfg)
 
 
 if __name__ == "__main__":
